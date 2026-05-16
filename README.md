@@ -1,3 +1,57 @@
+# How this project works
+
+Auto-recording is triggered by **detecting sound** in the audio input stream. Here is how and when it works:
+
+## Prerequisite: Recording Must Be Enabled
+Before any trigger can fire, recording must be enabled. This is controlled by the existence of a flag file at `data/record`:
+- If the file exists, the monitor is **armed** and listening for sound.
+- If it does not exist, audio is read but discarded.
+- You can toggle this via the web UI (`main.html`) or by starting `auto_record.py` with the `disabled` argument.
+
+## How the Trigger Works (`auto_record.py`)
+The script runs in a continuous loop reading small audio blocks (500 frames ≈ **62.5 ms** at 8 kHz, stereo 16-bit):
+
+### 1. Listening Mode
+- The script maintains a short rolling buffer of the last ~1 second of audio.
+- For each new block, it calculates the **RMS volume** and compares it against a noise threshold.
+
+### 2. Start Trigger
+Recording starts when **2 out of the last 3 audio blocks** exceed the noise threshold:
+
+```python
+# In run_listen_logic()
+for index in range(-1, -4, -1):
+    if self.data_queue[index].is_noisy(self.noise_threashold):
+        count += 1
+if count >= 2:
+    self.start_recording()
+```
+
+This means a brief burst of sound (~125–190 ms) is enough to start a recording.
+
+### 3. Noise Threshold
+- **Default:** `0.1` (normalized RMS).
+- **Calibrated:** If you run `python auto_record.py calibrate`, it measures your ambient baseline, then asks you to make a noise. It saves the resulting threshold to `data/calibrated`, which is loaded on the next run.
+
+## When Recording Stops
+Once recording starts, it stops only when:
+- **10 seconds of continuous silence** pass (measured in those same 62.5 ms blocks). The file keeps up to 2 seconds of trailing silence for natural padding.
+- **Recording is disabled** mid-capture (via web UI or deleting the `data/record` file). The current file is finalized immediately.
+
+## Output Filter
+Recordings shorter than **2 seconds** are automatically deleted; only longer ones are kept as `.wav` + `.json` pairs in the `data/` directory.
+
+---
+
+### Summary
+| Condition | Action |
+|---|---|
+| `data/record` file missing | No monitoring; nothing is recorded |
+| 2 of last 3 blocks exceed threshold | **Start recording** |
+| 10 seconds of silence | Stop recording and save |
+| Recording disabled mid-capture | Stop and save immediately |
+| Final file < 2 seconds | Discard |
+
 # Sound Activated Audio Recorder
 
 Auto Record is a Python script that records audio in WAV files.

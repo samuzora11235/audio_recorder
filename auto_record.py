@@ -38,7 +38,7 @@ import pyaudio
 DATA_DIR = "data"               # Directory for output files
 RECORD_ENABLED_FILE = "record"  # File existance enables / disables recording
 CALIBRATION_FILE = "calibrated" # Noise threshold for calibration
-RATE = 8000                     # 8 KZ sampling - 8000 samples per second
+RATE = 44100                     # 4.41 KZ sampling - 44100 samples per second
 BLOCK_SIZE = 500                # Default read size - 16 blocks per second
 FORMAT = pyaudio.paInt16        # LE 16 bit, a common format
 CHANNELS = 2                    # 2 channel sterio is a comon format
@@ -387,73 +387,49 @@ class AutoRecordSession:
 
     def calibrate(self):
         """
-        Run an interactive calibration to generate a noise threshold level.
+        Run a silence-based calibration to generate a noise threshold level.
+        Measures ambient silence and sets the threshold well above it so that
+        any real sound triggers recording automatically.
         Write out result in the data/calibrated file.
         """
         self.start_session(False)
 
-        # State constants
-        BASELINE = 0
-        WAIT = 1
-        COLLECT = 2
-        DONE = 3
+        wait_time = 10
+        print("\n\nAudio Level Calibration")
+        print(f"Please remain quiet for {wait_time} seconds to measure the silence baseline...")
 
-        # Variables for calibration calculations
-        block_count = 0
-        total = 0.0
-        state = BASELINE
-        threshold = 0.0
-        baseline = 0.0
-
-        # Process:
-        # 1. Establish baseline of background noise
-        # 2. Wait for a significantly louder noise
-        # 3. Average the next 1 second of audio to calculate a threshold value
+        # Collect wait_time seconds of silence data
+        volumes = []
+        num_blocks = int(wait_time * RATE / BLOCK_SIZE)
 
         try:
-            print("\n\nAudio Level Calibration")
-            print("Establishing a baseline...")
-            while self.in_stream is not None and state != DONE:
-                # Read a block 
+            for _ in range(num_blocks):
                 data = self.in_stream.read(BLOCK_SIZE)
                 block = AudioDataBlock(data)
+                volumes.append(block.volume)
 
-                # Process audio block accordin to the curren state
-                if state == BASELINE:
-                    # Establish a baseline
-                    block_count +=1
-                    total += block.volume
-                    if block_count == RATE/BLOCK_SIZE:
-                        # 1s to establish baseline
-                        baseline = total / block_count
-                        print("Baseline volume: %f" % baseline)
-                        print("Make a noise at the recording threshold...")
-                        state = WAIT
+            # Compute mean and standard deviation of silence
+            mean = sum(volumes) / len(volumes)
+            variance = sum((v - mean) ** 2 for v in volumes) / len(volumes)
+            std_dev = math.sqrt(variance)
 
-                if state == WAIT:
-                    # Wait for volume >> baseline
-                    if block.volume > 5 * baseline:
-                        print("Start collection")
-                        total = 0
-                        block_count = 0
-                        state = COLLECT
+            # Threshold = mean + 3 standard deviations.
+            # This captures >99% of normal silence fluctuation while
+            # reliably triggering on any genuine sound.
+            threshold = mean + 3 * std_dev
 
-                if state == COLLECT:
-                    print("collect: %f" % block.volume)
-                    total += block.volume
-                    block_count += 1
-                    if block_count == RATE * 0.25 / BLOCK_SIZE:
-                        # 1s to establish trigger level
-                        threshold = total / block_count
-                        state = DONE
+            # Prevent impossibly low thresholds in near-digital-silence conditions
+            threshold = max(threshold, 0.001)
 
-            file = open(self.calibration_file(), 'w')
-            file.write(str(threshold))
-            file.close()
+            print("Baseline volume: %f" % mean)
+            print("Standard deviation: %f" % std_dev)
+            print("Calibration threshold: %f" % threshold)
+
+            with open(self.calibration_file(), 'w') as f:
+                f.write(str(threshold))
             print("Calibration value saved: %f" % threshold)
 
         except KeyboardInterrupt:
-            # Catch ^C to ensure we cleanup (not strictly necessary)
             pass
         self.cleanup_session()
 
