@@ -8,11 +8,11 @@ is a period of silence.
 The WAV files can be accessed via a simple web service implemented
 in web_server.py
 
-Run `auto_record.py` when there are only ambient sounds. It first builds baseline for 10 seconds and then will listen for noises and automatically record them as wav files into the sub-directory `data`.
+Run `auto_record.py` when there are only ambient sounds. It first builds an ambient baseline for 10 seconds and then listens for noises and automatically records them as WAV files into the sub-directory `data`.
 
 # How this project works
 
-Auto-recording is triggered by **detecting sound** in the audio input stream. Here is how and when it works:
+Auto-recording is triggered by **detecting a rising RMS sound level** in the audio input stream. Here is how and when it works:
 
 ## Prerequisite: Recording Must Be Enabled
 Before any trigger can fire, recording must be enabled. This is controlled by the existence of a flag file at `data/record`:
@@ -21,37 +21,49 @@ Before any trigger can fire, recording must be enabled. This is controlled by th
 - You can toggle this via the web UI (`main.html`) or by starting `auto_record.py` with the `disabled` argument.
 
 ## How the Trigger Works (`auto_record.py`)
-The script runs in a continuous loop reading small audio blocks (500 frames ≈ **62.5 ms** at 8 kHz, stereo 16-bit):
+The script runs in a continuous loop reading audio blocks of 2048 frames at 44.1 kHz. Each block is about 46 ms of 16-bit PCM audio.
 
-### 1. Listening Mode
-- The script maintains a short rolling buffer of the last ~1 second of audio.
-- For each new block, it calculates the **RMS volume** and compares it against a noise threshold.
+### 1. Baseline Mode
+- At startup, normal microphone mode and command-input mode both spend 10 seconds measuring ambient RMS volume.
+- The baseline stores the ambient mean and standard deviation.
+- The resulting baseline threshold is used as a fixed gate, so small local changes inside the ambient noise floor do not trigger recording.
 
-### 2. Start Trigger
-Recording starts when **2 out of the last 3 audio blocks** exceed the noise threshold:
+### 2. Listening Mode
+- The script maintains a rolling RMS history while listening.
+- For each new block, it compares recent smoothed RMS against an older smoothed RMS window.
+- This detects a **rising sound trend**, not just a fixed loudness level.
 
-```python
-# In run_listen_logic()
-for index in range(-1, -4, -1):
-    if self.data_queue[index].is_noisy(self.noise_threashold):
-        count += 1
-if count >= 2:
-    self.start_recording()
-```
+### 3. Start Trigger
+Recording starts only when both conditions are true:
+- The recent smoothed RMS rises fast enough above an older local RMS window.
+- The recent smoothed RMS is also above the startup ambient baseline threshold.
 
-This means a brief burst of sound (~125–190 ms) is enough to start a recording.
+This makes the recorder less sensitive to steady fan noise, background hum, or small ambient drift.
 
-### 3. Noise Threshold
-- **Default:** `0.1` (normalized RMS).
-- **Calibrated:** If you run `python auto_record.py calibrate`, it measures your ambient baseline, then asks you to make a noise. It saves the resulting threshold to `data/calibrated`, which is loaded on the next run.
+### 4. Noise Threshold
+- **Startup baseline:** Each run measures 10 seconds of ambient sound before triggering can start.
+- **Default continuation threshold:** `0.1` normalized RMS is still used while recording to decide when enough silence has passed to stop.
+- **Calibrated continuation threshold:** If `data/calibrated` exists, that value is loaded and used instead of the default continuation threshold.
 
 ## When Recording Stops
 Once recording starts, it stops only when:
-- **10 seconds of continuous silence** pass (measured in those same 62.5 ms blocks). The file keeps up to 2 seconds of trailing silence for natural padding.
+- **2 seconds of continuous silence** pass. The file keeps up to 2 seconds of trailing silence for natural padding.
 - **Recording is disabled** mid-capture (via web UI or deleting the `data/record` file). The current file is finalized immediately.
 
 ## Output Filter
-Recordings shorter than **2 seconds** are automatically deleted; only longer ones are kept as `.wav` + `.json` pairs in the `data/` directory.
+Recordings shorter than **1.5 seconds** are automatically deleted; only longer ones are kept as `.wav` + `.json` pairs in the `data/` directory.
+
+## Command Input Mode
+For testing and batch processing, `auto_record.py` can read raw 16-bit PCM audio from another command instead of the microphone:
+
+```
+python auto_record.py command ffmpeg.exe -i samples/s3.wav -loglevel quiet -f s16le -acodec pcm_s16le -ac 1 -ar 44100 -
+```
+
+Command mode expects mono signed 16-bit little-endian PCM at 44.1 kHz on stdout. It uses the same 10-second baseline, trigger, stop, and output logic as microphone mode. JSON metadata for command-mode recordings includes:
+- `command_timestamp`: wall-clock time when the command was started.
+- `source_start_seconds`: start time of the snippet in the source audio stream.
+- `source_end_seconds`: end time of the snippet in the source audio stream.
 
 ---
 
@@ -59,10 +71,11 @@ Recordings shorter than **2 seconds** are automatically deleted; only longer one
 | Condition | Action |
 |---|---|
 | `data/record` file missing | No monitoring; nothing is recorded |
-| 2 of last 3 blocks exceed threshold | **Start recording** |
-| 10 seconds of silence | Stop recording and save |
+| 10-second startup baseline complete | Begin listening for rising RMS events |
+| RMS slope trigger exceeds local and baseline thresholds | **Start recording** |
+| 2 seconds of silence | Stop recording and save |
 | Recording disabled mid-capture | Stop and save immediately |
-| Final file < 2 seconds | Discard |
+| Final file < 1.5 seconds | Discard |
 
 ## Scripts
 
@@ -101,12 +114,13 @@ pip install -r requirements.txt
 
 ## Running the Audio Recorder
 
-The recording script can be run directory from the command line:
+The recording script can be run directly from the command line:
 
-python auto_record.py [ debug ] [ calibrate | disabled ]
+python auto_record.py [ debug ] [ calibrate | disabled | command <input command> ]
 - debug: print debug information
 - calibrate: run an interactive audio calibration and exit
 - disabled: start the recorder with recording disabled
+- command: read raw PCM audio from a command instead of the microphone
 
 ```
 source ./venv/bin/activate
@@ -128,9 +142,10 @@ Connect to localhost:3000 to see the list of recordings.
 
 ## Calibration
 
-Calibrate the trigger threshold by running an interactive calibraiton process.
-The process needs 2 seconds of quiet to establish a baseline, then a 1/2 second
-noise at the level that should trigger a recording.
+Calibrate the continuation threshold by running an interactive calibration process.
+The process measures 10 seconds of quiet ambient audio and writes a threshold to
+`data/calibrated`. Normal recording also builds a 10-second startup baseline on
+each run, so calibration is optional for start detection.
 
 ```
 source ./venv/bin/activate
@@ -145,6 +160,17 @@ In this directory, it creates:
 - .json files - information for each recording in json format
 - record - if present, recording is enabled
 - calibrated - created by the calibraiton process.
+
+## Changes Since Commit 6637faf
+
+The current behavior includes the functional changes introduced from commit `6637faf` onward:
+- Startup recording now establishes a 10-second ambient baseline before start detection is allowed.
+- Start detection uses a sliding-window RMS trend/slope check plus the ambient baseline threshold.
+- The minimum retained recording length is 1.5 seconds.
+- Audio reads use larger 2048-frame blocks at 44.1 kHz and tolerate PyAudio input overflows without crashing.
+- Output filenames include microseconds to avoid collisions when multiple snippets are created in the same second.
+- Command input mode can simulate a microphone from ffmpeg or another raw PCM producer.
+- Command-mode JSON includes command start time and source audio offsets.
 
 
 ## Web Service
