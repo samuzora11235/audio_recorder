@@ -32,6 +32,7 @@ import sys
 import logging
 import logging.config
 import collections
+import subprocess
 import pyaudio
 
 
@@ -42,9 +43,10 @@ RATE = 44100                     # 4.41 KZ sampling - 44100 samples per second
 BLOCK_SIZE = 2048                # Default read size - 16 blocks per second
 FORMAT = pyaudio.paInt16        # LE 16 bit, a common format
 CHANNELS = 2                    # 2 channel sterio is a comon format
+SAMPLE_WIDTH = 2
 
-# Number of blocks of silence to trigger recording stop - 10 seconds
-SILENCE_TRIGGER_DURATION = 10 * RATE/BLOCK_SIZE  
+# Number of blocks of silence to trigger recording stop - 2 seconds
+SILENCE_TRIGGER_DURATION = 2 * RATE/BLOCK_SIZE  
 
 # Number of blocks of silence to write before pausing - 2 seconds
 SILENCE_WRITE_DURATION = 2 * RATE/BLOCK_SIZE        
@@ -54,11 +56,17 @@ SILENCE_LISTEN_DURATION = RATE/BLOCK_SIZE
 
 # Default threshold for noise/silence normalized to 1.0
 DEFAULT_NOISE_THRESHOLD=0.1    
-START_TRIGGER_WINDOW = 6
-START_TRIGGER_REQUIRED_NOISY_BLOCKS = 4
 CALIBRATION_STD_DEV_MULTIPLIER = 6
 CALIBRATION_MIN_BASELINE_MULTIPLIER = 3
 CALIBRATION_MIN_ABSOLUTE_THRESHOLD = 0.003
+RMS_BACKGROUND_WINDOW_BLOCKS = 60
+RMS_SMOOTHING_BLOCKS = 4
+RMS_SLOPE_GAP_BLOCKS = 6
+RMS_MIN_RISE = 0.004
+RMS_MIN_SLOPE = 0.0007
+RMS_MIN_BACKGROUND_DELTA = 0.003
+RMS_MIN_LOCAL_RATIO = 1.5
+MIN_RECORDING_SECONDS = 1.5
 
 # Logging object
 logger = logging.getLogger('auto_record')
@@ -76,6 +84,10 @@ def calc_rms(samples: list[float]) -> float:
        sum_squares += sample*sample
 
     return math.sqrt( sum_squares / len(samples) )
+
+
+def calc_mean(values) -> float:
+    return sum(values) / len(values)
 
 
 class AudioDataBlock:
@@ -130,14 +142,19 @@ class AutoRecordSession:
         self.open_time = None                   # datetime.datetime of recording start (within a few seconds)
         self.out_file_name = None               # Open file for writing, if any
         self.in_stream = None                   # PyAudio input stream
+        self.input_process = None
+        self.input_channels = CHANNELS
         self.is_recording = False               # Listening or Recording
         self.silence_count = 0                  # Count number of seqential silent blocks read
         self.noise_threashold = DEFAULT_NOISE_THRESHOLD
 
         # Buffered data
         self.data_queue: collections.deque[AudioDataBlock] = collections.deque()
+        self.rms_history: collections.deque[float] = collections.deque(
+            maxlen=RMS_BACKGROUND_WINDOW_BLOCKS
+        )
 
-    def start_session(self, enabled: bool):
+    def prepare_session(self, enabled: bool):
         # Ensure data directory exists
         try:
             os.mkdir(DATA_DIR)
@@ -163,6 +180,9 @@ class AutoRecordSession:
                 os.remove(path)
             except FileNotFoundError:
                 pass
+
+    def start_session(self, enabled: bool):
+        self.prepare_session(enabled)
 
         logger.info("Default device:")
         info = self.audio.get_default_input_device_info()
@@ -191,6 +211,14 @@ class AutoRecordSession:
                 frames_per_buffer=BLOCK_SIZE)
         logger.info("Audio stream open")
 
+    def start_command_session(self, enabled: bool, command: list[str]) -> None:
+        self.prepare_session(enabled)
+        self.input_channels = 1
+        logger.info("Opening audio input command: %s", " ".join(command))
+        self.input_process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        self.in_stream = self.input_process.stdout
+        logger.info("Audio input command open")
+
     def read_audio_data(self) -> bytes | None:
         try:
             return self.in_stream.read(BLOCK_SIZE, exception_on_overflow=False)
@@ -198,15 +226,29 @@ class AutoRecordSession:
             logger.warning("Audio input overflow; skipping one block: %s", err)
             return None
 
+    def read_command_audio_data(self) -> bytes | None:
+        block_bytes = BLOCK_SIZE * self.input_channels * SAMPLE_WIDTH
+        data = self.in_stream.read(block_bytes)
+        if data == b"":
+            return None
+        return data
+
     def cleanup_session(self):
         """
         Stop and cleanup
         """
-        if self.in_stream is not None:
+        if self.input_process is not None:
+            if self.in_stream is not None:
+                self.in_stream.close()
+            self.input_process.wait()
+            self.input_process = None
+            self.in_stream = None
+        elif self.in_stream is not None:
             self.in_stream.stop_stream()
             self.in_stream.close()
             self.in_stream = None
-        self.audio.terminate()
+        if self.audio is not None:
+            self.audio.terminate()
 
     def run(self, enabled: bool):
         """
@@ -242,6 +284,32 @@ class AutoRecordSession:
                 self.stop_recording()
         self.cleanup_session()
 
+    def run_command(self, enabled: bool, command: list[str]) -> None:
+        self.start_command_session(enabled, command)
+        try:
+            while self.in_stream is not None:
+                data = self.read_command_audio_data()
+                if data is None:
+                    if self.is_recording:
+                        self.stop_recording()
+                    break
+
+                if not self.check_recording_enabled():
+                    continue
+
+                block = AudioDataBlock(data)
+                self.data_queue.append(block)
+
+                if not self.is_recording:
+                    self.run_listen_logic()
+                elif self.is_recording:
+                    self.run_record_logic()
+
+        except KeyboardInterrupt:
+            if self.is_recording:
+                self.stop_recording()
+        self.cleanup_session()
+
     def start_recording(self) -> None:
         """
         Start the recording session, change to recording mode
@@ -257,6 +325,7 @@ class AutoRecordSession:
         """
         self.is_recording = False
         self.ensure_close_file()
+        self.rms_history.clear()
         # Ensure no extra data is buffered
         while len(self.data_queue) > SILENCE_LISTEN_DURATION:
             self.data_queue.popleft()
@@ -270,21 +339,44 @@ class AutoRecordSession:
 
         Assumed: mode == LISTEN
         """
-        # Check for 2 of 3 noisy frames
-        if len(self.data_queue) >= START_TRIGGER_WINDOW:
-            # Check if noise threashold exceeded
-            count = 0
-            for index in range(-1, -START_TRIGGER_WINDOW - 1, -1):
-                if self.data_queue[index].is_noisy(self.noise_threashold):
-                    count += 1
-            if count >= START_TRIGGER_REQUIRED_NOISY_BLOCKS:
-                # Trigger recording
-                self.start_recording()
+        if self.is_rising_sound():
+            self.start_recording()
 
         # Discard frames that will never be recorded
         if not self.is_recording:
             while len(self.data_queue) > SILENCE_LISTEN_DURATION:
                 self.data_queue.popleft()
+
+    def is_rising_sound(self) -> bool:
+        if len(self.data_queue) == 0:
+            return False
+
+        self.rms_history.append(self.data_queue[-1].volume)
+        needed_blocks = RMS_SMOOTHING_BLOCKS * 2 + RMS_SLOPE_GAP_BLOCKS
+        if len(self.rms_history) < needed_blocks:
+            return False
+
+        recent_values = list(self.rms_history)[-RMS_SMOOTHING_BLOCKS:]
+        older_end = len(self.rms_history) - RMS_SMOOTHING_BLOCKS - RMS_SLOPE_GAP_BLOCKS
+        older_start = older_end - RMS_SMOOTHING_BLOCKS
+        older_values = list(self.rms_history)[older_start:older_end]
+
+        recent_rms = calc_mean(recent_values)
+        older_rms = calc_mean(older_values)
+        rise = recent_rms - older_rms
+        slope = rise / RMS_SLOPE_GAP_BLOCKS
+
+        local_threshold = max(
+            older_rms * RMS_MIN_LOCAL_RATIO,
+            older_rms + RMS_MIN_BACKGROUND_DELTA,
+            CALIBRATION_MIN_ABSOLUTE_THRESHOLD,
+        )
+
+        return (
+            recent_rms >= local_threshold
+            and rise >= RMS_MIN_RISE
+            and slope >= RMS_MIN_SLOPE
+        )
 
     def run_record_logic(self) -> None:
         """
@@ -346,15 +438,16 @@ class AutoRecordSession:
             return
         
         now = datetime.datetime.now()
+        base_name = "%04d-%02d-%02d_%02d_%02d_%02d_%06d" % (
+            now.year, now.month, now.day, now.hour, now.minute, now.second, now.microsecond
+        )
         self.open_time = now
-        self.out_file_name = "%04d-%02d-%02d_%02d_%02d_%02d" % (
-            now.year, now.month, now.day, now.hour, now.minute, now.second
-        ) 
+        self.out_file_name = base_name
 
-        path = os.path.join(DATA_DIR, "%s.tmp" % self.out_file_name)
+        path = os.path.join(DATA_DIR, "%s.tmp" % base_name)
         self.out_file = wave.open(path, 'wb')
-        self.out_file.setnchannels(CHANNELS)
-        self.out_file.setsampwidth(self.audio.get_sample_size(FORMAT))
+        self.out_file.setnchannels(self.input_channels)
+        self.out_file.setsampwidth(SAMPLE_WIDTH)
         self.out_file.setframerate(RATE)
 
     def ensure_close_file(self) -> None:
@@ -379,7 +472,7 @@ class AutoRecordSession:
         path_wav = os.path.join(DATA_DIR, wav_name)
         path_json = os.path.join(DATA_DIR, json_name)
 
-        recording_length = int(self.out_file.getnframes() / RATE)
+        recording_length = self.out_file.getnframes() / RATE
 
         info = {"sound_file": wav_name,
                 "basename": self.out_file_name,
@@ -388,7 +481,7 @@ class AutoRecordSession:
                 "length": recording_length }
 
         # Capture files that are 2 seconds or longer
-        if recording_length >= 2:
+        if recording_length >= MIN_RECORDING_SECONDS:
             os.rename(path_tmp, path_wav)
             with open(path_json, 'w') as file:
                 file.write(json.dumps(info))
@@ -513,15 +606,24 @@ if __name__ == "__main__":
     logger.info("Starting session...")
     session = AutoRecordSession()
     enabled = True
+    input_command = None
     if len(sys.argv) > 1:
         if sys.argv[1].lower() == "calibrate":
             session.calibrate()
             sys.exit(0)
         elif sys.argv[1].lower() == "disabled":
             enabled = False
+        elif sys.argv[1].lower() == "command":
+            input_command = sys.argv[2:]
+            if len(input_command) == 0:
+                print("usage: [debug] [calibrate | disabled | command <input command>]")
+                sys.exit(-1)
         else:
-            print("usage: [debug] [calibrate | disabled]")
+            print("usage: [debug] [calibrate | disabled | command <input command>]")
             sys.exit(-1)
 
     # Run the recording
-    session.run(enabled)
+    if input_command is None:
+        session.run(enabled)
+    else:
+        session.run_command(enabled, input_command)
