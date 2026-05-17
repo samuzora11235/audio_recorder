@@ -1,3 +1,15 @@
+# Sound Activated Audio Recorder
+
+Auto Record is a Python script that records audio in WAV files.
+Instead of recording continuously, Auto Record creates multiple
+recordings, starting when noise is detected and stopping when there
+is a period of silence.
+
+The WAV files can be accessed via a simple web service implemented
+in web_server.py
+
+Run `auto_record.py` when there are only ambient sounds. It first builds baseline for 10 seconds and then will listen for noises and automatically record them as wav files into the sub-directory `data`.
+
 # How this project works
 
 Auto-recording is triggered by **detecting sound** in the audio input stream. Here is how and when it works:
@@ -51,16 +63,6 @@ Recordings shorter than **2 seconds** are automatically deleted; only longer one
 | 10 seconds of silence | Stop recording and save |
 | Recording disabled mid-capture | Stop and save immediately |
 | Final file < 2 seconds | Discard |
-
-# Sound Activated Audio Recorder
-
-Auto Record is a Python script that records audio in WAV files.
-Instead of recording continuously, Auto Record creates multiple
-recordings, starting when noise is detected and stopping when there
-is a period of silence.
-
-The WAV files can be accessed via a simple web service implemented
-in web_server.py
 
 ## Scripts
 
