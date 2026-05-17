@@ -39,7 +39,7 @@ DATA_DIR = "data"               # Directory for output files
 RECORD_ENABLED_FILE = "record"  # File existance enables / disables recording
 CALIBRATION_FILE = "calibrated" # Noise threshold for calibration
 RATE = 44100                     # 4.41 KZ sampling - 44100 samples per second
-BLOCK_SIZE = 500                # Default read size - 16 blocks per second
+BLOCK_SIZE = 2048                # Default read size - 16 blocks per second
 FORMAT = pyaudio.paInt16        # LE 16 bit, a common format
 CHANNELS = 2                    # 2 channel sterio is a comon format
 
@@ -54,6 +54,11 @@ SILENCE_LISTEN_DURATION = RATE/BLOCK_SIZE
 
 # Default threshold for noise/silence normalized to 1.0
 DEFAULT_NOISE_THRESHOLD=0.1    
+START_TRIGGER_WINDOW = 6
+START_TRIGGER_REQUIRED_NOISY_BLOCKS = 4
+CALIBRATION_STD_DEV_MULTIPLIER = 6
+CALIBRATION_MIN_BASELINE_MULTIPLIER = 3
+CALIBRATION_MIN_ABSOLUTE_THRESHOLD = 0.003
 
 # Logging object
 logger = logging.getLogger('auto_record')
@@ -186,6 +191,13 @@ class AutoRecordSession:
                 frames_per_buffer=BLOCK_SIZE)
         logger.info("Audio stream open")
 
+    def read_audio_data(self) -> bytes | None:
+        try:
+            return self.in_stream.read(BLOCK_SIZE, exception_on_overflow=False)
+        except OSError as err:
+            logger.warning("Audio input overflow; skipping one block: %s", err)
+            return None
+
     def cleanup_session(self):
         """
         Stop and cleanup
@@ -205,7 +217,9 @@ class AutoRecordSession:
         try:
             while self.in_stream is not None:
                 # Read a block of audio
-                data = self.in_stream.read(BLOCK_SIZE)
+                data = self.read_audio_data()
+                if data is None:
+                    continue
 
                 # if we are not enabled for recording, ensure any
                 # in process recording is completed and the buffer is empty
@@ -257,13 +271,13 @@ class AutoRecordSession:
         Assumed: mode == LISTEN
         """
         # Check for 2 of 3 noisy frames
-        if len(self.data_queue) > 2:
+        if len(self.data_queue) >= START_TRIGGER_WINDOW:
             # Check if noise threashold exceeded
             count = 0
-            for index in range(-1, -4, -1):
+            for index in range(-1, -START_TRIGGER_WINDOW - 1, -1):
                 if self.data_queue[index].is_noisy(self.noise_threashold):
                     count += 1
-            if count >= 2:
+            if count >= START_TRIGGER_REQUIRED_NOISY_BLOCKS:
                 # Trigger recording
                 self.start_recording()
 
@@ -404,9 +418,15 @@ class AutoRecordSession:
 
         try:
             for _ in range(num_blocks):
-                data = self.in_stream.read(BLOCK_SIZE)
+                data = self.read_audio_data()
+                if data is None:
+                    continue
                 block = AudioDataBlock(data)
                 volumes.append(block.volume)
+
+            if len(volumes) == 0:
+                print("Calibration failed: no audio blocks were captured.")
+                return
 
             # Compute mean and standard deviation of silence
             mean = sum(volumes) / len(volumes)
@@ -416,10 +436,14 @@ class AutoRecordSession:
             # Threshold = mean + 3 standard deviations.
             # This captures >99% of normal silence fluctuation while
             # reliably triggering on any genuine sound.
-            threshold = mean + 3 * std_dev
+            threshold = mean + CALIBRATION_STD_DEV_MULTIPLIER * std_dev
 
             # Prevent impossibly low thresholds in near-digital-silence conditions
-            threshold = max(threshold, 0.001)
+            threshold = max(
+                threshold,
+                mean * CALIBRATION_MIN_BASELINE_MULTIPLIER,
+                CALIBRATION_MIN_ABSOLUTE_THRESHOLD,
+            )
 
             print("Baseline volume: %f" % mean)
             print("Standard deviation: %f" % std_dev)
